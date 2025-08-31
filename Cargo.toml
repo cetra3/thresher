@@ -1,0 +1,17 @@
+[package]
+name = "thresher"
+version = "0.1.0"
+edition = "2024"
+authors = ["cetra3 <cetra3@hotmail.com>"]
+description = "Execute a callback when a memory threshold is reached"
+license = "MIT/Apache-2.0"
+repository = "https://github.com/cetra3/thresher"
+readme = "README.md"
+keywords = ["allocator", "memory"]
+categories = ["memory-management"]
+
+
+[dev-dependencies]
+tikv-jemallocator = { version = "0.6.0", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
+jemalloc_pprof = { version = "0.8.0", features = ["symbolize"]}
+tokio = { version = "1.47.1", features = ["full"] }

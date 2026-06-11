@@ -1,6 +1,6 @@
 [package]
 name = "thresher"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 authors = ["cetra3 <cetra3@hotmail.com>"]
 description = "Execute a callback when a memory threshold is reached"

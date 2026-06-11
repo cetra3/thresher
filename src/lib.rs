@@ -109,6 +109,17 @@ impl<A> Thresher<A> {
             .expect("Callback is already registered");
     }
 
+    /// Returns the current number of bytes allocated.
+    pub fn get_allocated(&self) -> usize {
+        self.allocated.load(Ordering::Acquire)
+    }
+
+    /// Returns the current threshold.
+    pub fn get_threshold(&self) -> usize {
+        self.threshold.load(Ordering::Acquire)
+    }
+
+
     fn maybe_callback(&self, allocation_size: usize) {
         let threshold = self.threshold.load(Ordering::Acquire);
         let old_allocated = self.allocated.fetch_add(allocation_size, Ordering::Release);

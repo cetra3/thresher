@@ -9,9 +9,20 @@ repository = "https://github.com/cetra3/thresher"
 readme = "README.md"
 keywords = ["allocator", "memory"]
 categories = ["memory-management"]
+# `benches/common.rs` is a shared module, not a bench target of its own
+autobenches = false
 
 
 [dev-dependencies]
 tikv-jemallocator = { version = "0.6.0", features = ["profiling", "unprefixed_malloc_on_supported_platforms"] }
 jemalloc_pprof = { version = "0.8.0", features = ["symbolize"]}
 tokio = { version = "1.47.1", features = ["full"] }
+criterion = { version = "0.7.0", default-features = false, features = ["cargo_bench_support"] }
+
+[[bench]]
+name = "system"
+harness = false
+
+[[bench]]
+name = "thresher"
+harness = false

@@ -3,6 +3,12 @@
 //! A binary can only have one `#[global_allocator]`, so the two targets run the
 //! *same* workloads under different allocators and the results are compared by
 //! benchmark id: `system/alloc_free/16` vs `thresher/alloc_free/16`, etc.
+//!
+//! Sanity check when changing any of this: `contention/1` and `alloc_free` are
+//! both a single thread doing alloc/free in a loop, so their per-op costs should
+//! agree, and a wrapper can never come out faster than the allocator it
+//! delegates to. A `thresher/*` figure at or below its `system/*` counterpart
+//! means the harness is measuring something other than allocation.
 
 use std::hint::black_box;
 use std::sync::{Arc, Barrier};
@@ -73,6 +79,17 @@ fn bench_patterns(c: &mut Criterion, prefix: &str) {
 /// A global allocator that keeps its accounting in a single shared counter
 /// serialises every thread on that cache line, so the per-op cost should climb
 /// with the thread count even though the threads share no data of their own.
+///
+/// Each worker clocks its own loop and the sample is the slowest of them. Timing
+/// the whole group from this thread instead — start the clock, wait on a finish
+/// barrier — folds `thread::spawn` and the workers' barrier wake-up skew into the
+/// measurement, and both of those grow with the thread count. That reads as
+/// allocator contention while actually being the scheduler, and it swamps the
+/// accounting cost this is here to measure.
+///
+/// Thread counts above the machine's available parallelism measure
+/// oversubscription rather than contention: once the cores are saturated,
+/// throughput flattens no matter what the allocator does.
 fn bench_contention(c: &mut Criterion, prefix: &str) {
     let mut group = c.benchmark_group(format!("{prefix}/contention"));
 
@@ -83,36 +100,39 @@ fn bench_contention(c: &mut Criterion, prefix: &str) {
             &threads,
             |b, &threads| {
                 b.iter_custom(|iters| {
-                    // +1 for this thread, which acts as the starter and the clock.
+                    // +1 for this thread, which releases the workers but does
+                    // not time them.
                     let start_line = Arc::new(Barrier::new(threads + 1));
-                    let finish_line = Arc::new(Barrier::new(threads + 1));
 
                     let handles: Vec<_> = (0..threads)
                         .map(|_| {
                             let start_line = Arc::clone(&start_line);
-                            let finish_line = Arc::clone(&finish_line);
                             thread::spawn(move || {
                                 start_line.wait();
+                                // Clock starts *after* the barrier releases, so
+                                // neither the spawn nor the wake-up is charged
+                                // to the allocator.
+                                let started = Instant::now();
                                 for _ in 0..iters {
                                     for _ in 0..OPS_PER_ITER {
                                         alloc_free(64);
                                     }
                                 }
-                                finish_line.wait();
+                                started.elapsed()
                             })
                         })
                         .collect();
 
                     start_line.wait();
-                    let started = Instant::now();
-                    finish_line.wait();
-                    let elapsed = started.elapsed();
 
-                    for handle in handles {
-                        handle.join().unwrap();
-                    }
-
-                    elapsed
+                    // Every worker runs the same loop from the same start line,
+                    // so the slowest one spans the whole contended region and
+                    // the rest overlap it.
+                    handles
+                        .into_iter()
+                        .map(|handle| handle.join().unwrap())
+                        .max()
+                        .unwrap_or_default()
                 });
             },
         );

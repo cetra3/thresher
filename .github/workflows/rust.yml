@@ -23,3 +23,15 @@ jobs:
     # Compile only: benchmark timings from shared CI runners aren't worth acting on
     - name: Build benchmarks
       run: cargo bench --no-run --verbose
+
+  # `set_alloc_error_hook` is unstable, so the opt-in feature needs nightly.
+  # The stable job above is what guarantees the default build stays stable.
+  alloc-error-hook:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - run: rustup toolchain install nightly --profile minimal
+    - name: Build with the hook
+      run: cargo +nightly build --features alloc-error-hook --verbose
+    - name: Run the hard limit example
+      run: cargo +nightly run --release --example hard_limit --features alloc-error-hook

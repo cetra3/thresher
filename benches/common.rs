@@ -125,14 +125,17 @@ fn bench_contention(c: &mut Criterion, prefix: &str) {
 
                     start_line.wait();
 
-                    // Every worker runs the same loop from the same start line,
-                    // so the slowest one spans the whole contended region and
-                    // the rest overlap it.
-                    handles
+                    // Average the workers rather than taking the slowest. They
+                    // all run the same loop from the same start line, so each is
+                    // an independent estimate of how long the contended region
+                    // lasted, and averaging N of them cuts the noise. `max` is an
+                    // extremum: it tracks whichever thread got unlucky, so its
+                    // variance *grows* with the thread count.
+                    let per_thread: Vec<Duration> = handles
                         .into_iter()
                         .map(|handle| handle.join().unwrap())
-                        .max()
-                        .unwrap_or_default()
+                        .collect();
+                    per_thread.iter().sum::<Duration>() / per_thread.len() as u32
                 });
             },
         );

@@ -166,14 +166,25 @@ sharing no data of their own. What matters there is not the size of the overhead
 but whether it *grows* with the thread count, because that is what a single
 shared counter would do. It doesn't:
 
+Cost per alloc/free pair relative to the bare system allocator:
+
 | threads | 1 | 2 | 4 | 8 |
 | --- | --- | --- | --- | --- |
-| thresher / system | 1.14 | 1.08 | 1.11 | 1.07 |
+| per-thread batching | 1.14× | 1.11× | 1.09× | 1.14× |
+| one shared counter | 2.27× | 9.49× | 20.8× | 20.8× |
 
-Roughly a tenth on top of each allocation, flat across thread counts — the
-per-thread batching is doing its job. The isolated per-allocation path
-(`alloc_free`) costs more, around 1.4×, since there the bookkeeping cannot
-amortise across a loop.
+Roughly a tenth on top of each allocation, flat across thread counts. The second
+row is the same crate before the accounting was made thread local — a single
+`AtomicUsize` taking a `fetch_add` on every allocation, which is what the batching
+exists to avoid. It costs 2.3× with one thread just for the atomic, and an order
+of magnitude more once threads start fighting over the cache line: 396 ns per
+alloc/free pair at 8 threads against the bare allocator's 19 ns.
+
+The isolated per-allocation path (`alloc_free`) costs around 1.4×, more than the
+contention figure, because there the bookkeeping cannot amortise across a loop.
+In absolute terms it is ~4 ns per alloc/free pair at 16 B and 1 KiB and ~6 ns at
+64 KiB — near enough flat in nanoseconds, though not as a ratio, since the
+underlying allocation gets dearer with size.
 
 Two caveats on reading these. Thread counts above the machine's core count
 measure oversubscription rather than contention — throughput flattens once the

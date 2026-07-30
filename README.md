@@ -162,8 +162,27 @@ through the wrapper. Compare by benchmark id (`system/contention/8` against
 change against itself.
 
 The contention benchmark is the one to watch — N threads allocating at once,
-sharing no data of their own. Thresher currently tracks the bare allocator
-within noise up to 8 threads.
+sharing no data of their own. What matters there is not the size of the overhead
+but whether it *grows* with the thread count, because that is what a single
+shared counter would do. It doesn't:
+
+| threads | 1 | 2 | 4 | 8 |
+| --- | --- | --- | --- | --- |
+| thresher / system | 1.14 | 1.08 | 1.11 | 1.07 |
+
+Roughly a tenth on top of each allocation, flat across thread counts — the
+per-thread batching is doing its job. The isolated per-allocation path
+(`alloc_free`) costs more, around 1.4×, since there the bookkeeping cannot
+amortise across a loop.
+
+Two caveats on reading these. Thread counts above the machine's core count
+measure oversubscription rather than contention — throughput flattens once the
+cores are saturated no matter what the allocator does. And absolute nanosecond
+figures are not portable between machines: the same binaries measured 10 ns and
+17 ns per `malloc` on two different cloud hosts, so compare ratios from a single
+interleaved run rather than numbers from different sittings. Run-to-run spread on
+the ratio is a few percent; if you need tighter, raise `--measurement-time` and
+`--sample-size`.
 
 ## License
 

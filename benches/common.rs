@@ -4,11 +4,15 @@
 //! *same* workloads under different allocators and the results are compared by
 //! benchmark id: `system/alloc_free/16` vs `thresher/alloc_free/16`, etc.
 //!
-//! Sanity check when changing any of this: `contention/1` and `alloc_free` are
-//! both a single thread doing alloc/free in a loop, so their per-op costs should
-//! agree, and a wrapper can never come out faster than the allocator it
-//! delegates to. A `thresher/*` figure at or below its `system/*` counterpart
-//! means the harness is measuring something other than allocation.
+//! The invariant to check when changing any of this: a wrapper cannot be faster
+//! than the allocator it delegates to, so a `thresher/*` figure at or below its
+//! `system/*` counterpart means the harness has stopped measuring allocation.
+//!
+//! `contention/1` and `alloc_free` are both one thread allocating in a loop, so
+//! their per-op costs should land in the same ballpark — but not agree exactly.
+//! They use different sizes, and a tight loop lets the wrapper's thread-local
+//! bookkeeping amortise in a way an isolated call site does not, which shows up
+//! as a couple of ns on the `thresher` side.
 
 use std::hint::black_box;
 use std::sync::{Arc, Barrier};

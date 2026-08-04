@@ -896,6 +896,37 @@ mod tests {
         );
     }
 
+    /// What happens once this thread's state has been destroyed and something
+    /// later in the teardown allocates anyway: no batching left to do, so it
+    /// goes straight to the total rather than being lost.
+    ///
+    /// Reached through the accounting directly because the condition cannot be
+    /// staged from a test: `ThreadState` registers its destructor on a thread's
+    /// very first allocation, so it is the last thread local to be dropped.
+    #[test]
+    fn accounting_survives_the_thread_state_being_gone() {
+        let _guard = setup();
+
+        let size = 8 * RECONCILE_BATCH;
+
+        ALLOCATOR.flush();
+        let before = ALLOCATOR.get_allocated();
+        ALLOCATOR.record_alloc(None, size);
+        let allocated = ALLOCATOR.get_allocated();
+
+        ALLOCATOR.record_dealloc(None, size);
+        let settled = ALLOCATOR.get_allocated();
+
+        assert!(
+            allocated >= before + size,
+            "an allocation after the thread state was gone went missing"
+        );
+        assert!(
+            settled < allocated,
+            "a deallocation after the thread state was gone went missing"
+        );
+    }
+
     #[test]
     fn hard_limit_refuses_allocations_past_it() {
         let _guard = setup();

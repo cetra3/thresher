@@ -86,6 +86,7 @@
 use std::{
     alloc::{GlobalAlloc, Layout},
     cell::Cell,
+    panic::{self, AssertUnwindSafe},
     ptr,
     sync::{
         OnceLock,
@@ -288,9 +289,11 @@ impl<A> Thresher<A> {
     /// The callback runs inside the allocator, on whichever thread happened to
     /// cross the threshold, so there are two things it must not do:
     ///
-    /// * **Panic.** Unwinding out of an allocation is undefined behaviour. Keep
-    ///   the callback infallible; anything that might fail belongs on the other
-    ///   side of a channel, as in the `jemalloc` example.
+    /// * **Panic.** Unwinding out of an allocation is undefined behaviour, so
+    ///   the panic is caught here and swallowed: the callback stops where it
+    ///   panicked, and nothing is reported. Keep the callback infallible;
+    ///   anything that might fail belongs on the other side of a channel, as in
+    ///   the `jemalloc` example.
     /// * **Block on anything that allocates.** Taking a lock that another thread
     ///   holds while it is itself allocating will deadlock.
     ///
@@ -603,8 +606,22 @@ impl<A> Thresher<A> {
             return;
         }
 
+        // Created before the catch, not inside it: a panic allocates its
+        // payload, its message, and a backtrace if one is asked for, and those
+        // allocations come back through here. With the flag still set across the
+        // unwind they cannot re-enter the callback, and the hard limit does not
+        // refuse them — which matters, because the callback only ever runs when
+        // memory is already tight.
         let _reset = CallbackGuard;
-        callback(allocated);
+
+        // `GlobalAlloc` implementations must not unwind, and the callback is
+        // user code. Catching here is what makes that impossible rather than
+        // merely documented against.
+        //
+        // `AssertUnwindSafe` because the only state a panicking callback can
+        // leave torn is its own: nothing on this side of the boundary is handed
+        // to it, and nothing but the callback itself sees that state again.
+        let _ = panic::catch_unwind(AssertUnwindSafe(|| callback(allocated)));
     }
 }
 
@@ -711,6 +728,10 @@ mod tests {
     /// Whether the callback's own allocation was refused by the hard limit.
     static CALLBACK_REFUSED: AtomicBool = AtomicBool::new(false);
 
+    /// Makes the next callback run panic. Cleared as it is read, so one crossing
+    /// panics and the next does not.
+    static PANIC_NEXT: AtomicBool = AtomicBool::new(false);
+
     /// The callback can only be registered once for the whole test binary, and
     /// the threshold is process wide, so the tests take turns.
     static TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -796,11 +817,17 @@ mod tests {
 
                 let held: Vec<u8> = Vec::with_capacity(4 * RECONCILE_BATCH);
                 black_box(held.as_ptr());
+
+                // Last, so everything above still happened when it panics.
+                if PANIC_NEXT.swap(false, Ordering::Relaxed) {
+                    panic!("callback panicking on purpose");
+                }
             });
         });
 
         FIRES.store(0, Ordering::Relaxed);
         CALLBACK_REFUSED.store(false, Ordering::Relaxed);
+        PANIC_NEXT.store(false, Ordering::Relaxed);
 
         guard
     }
@@ -848,6 +875,43 @@ mod tests {
         drop(black_box(held));
     }
 
+    /// Unwinding out of `GlobalAlloc` is undefined behaviour, so a panicking
+    /// callback must not escape the allocator. It is caught and swallowed, the
+    /// process carries on, and the next crossing still runs the callback — the
+    /// re-entrancy flag has to come back down on the way out.
+    #[test]
+    fn a_panicking_callback_is_swallowed() {
+        let _guard = setup();
+
+        // The panic is expected, so keep its message out of the test output. It
+        // still allocates its payload, which is the part under test.
+        let previous_hook = panic::take_hook();
+        panic::set_hook(Box::new(|_| {}));
+
+        PANIC_NEXT.store(true, Ordering::Relaxed);
+
+        ALLOCATOR.flush();
+        ALLOCATOR.set_callback_threshold(ALLOCATOR.get_allocated() + 8 * 1024 * 1024);
+        let held = vec![0u8; 16 * 1024 * 1024];
+        assert_eq!(fires(), 1, "the callback did not run");
+        drop(black_box(held));
+
+        // Arm it again from wherever the total has settled.
+        ALLOCATOR.set_callback_threshold(usize::MAX);
+        ALLOCATOR.flush();
+        ALLOCATOR.set_callback_threshold(ALLOCATOR.get_allocated() + 4 * 1024 * 1024);
+        let held = vec![0u8; 16 * 1024 * 1024];
+        drop(black_box(held));
+
+        panic::set_hook(previous_hook);
+
+        assert_eq!(
+            fires(),
+            2,
+            "the callback stopped running after it panicked once"
+        );
+    }
+
     #[test]
     fn does_not_fire_below_threshold() {
         let _guard = setup();
@@ -870,9 +934,16 @@ mod tests {
 
         let held = vec![0u8; 32 * 1024 * 1024];
         ALLOCATOR.flush();
+
+        // Not `>= baseline + 32 MiB`: other threads in the test binary are
+        // finishing while this runs, and a thread that exits reconciles its
+        // balance from `ThreadState::drop`, which can be negative and pulls the
+        // shared total down. The point is that 32 MiB was counted, so leave room
+        // for that churn rather than assert to the byte.
+        let allocated = ALLOCATOR.get_allocated();
         assert!(
-            ALLOCATOR.get_allocated() >= baseline + 32 * 1024 * 1024,
-            "allocation was not accounted for"
+            allocated >= baseline + 24 * 1024 * 1024,
+            "allocation was not accounted for: {allocated} vs baseline {baseline}"
         );
 
         drop(black_box(held));
@@ -900,9 +971,14 @@ mod tests {
         let held: Vec<Vec<u8>> = (0..4096).map(|_| vec![0u8; 1024]).collect();
 
         ALLOCATOR.flush();
+
+        // Tolerant for the same reason as `accounting_returns_to_baseline`:
+        // threads finishing elsewhere reconcile balances into the total while
+        // this test runs.
+        let allocated = ALLOCATOR.get_allocated();
         assert!(
-            ALLOCATOR.get_allocated() >= baseline + 4 * 1024 * 1024,
-            "batched allocations went missing"
+            allocated >= baseline + 3 * 1024 * 1024,
+            "batched allocations went missing: {allocated} vs baseline {baseline}"
         );
 
         drop(black_box(held));

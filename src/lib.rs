@@ -101,6 +101,11 @@ static ALLOCATED: AtomicUsize = AtomicUsize::new(0);
 /// `Cell` of `Copy` types with a `const` initialiser, so access needs no lazy
 /// initialisation — which would not be safe to do from inside an allocator, and
 /// would recurse.
+///
+/// The `Drop` impl does mean a thread local destructor gets registered, and
+/// registering one can allocate (`_tlv_atexit` on macOS calls `malloc`), which
+/// would re-enter the allocator on a thread's first allocation. Measured on
+/// glibc, it does not: the first allocation on a thread does not nest.
 struct ThreadState {
     /// Allocated bytes the shared total has not seen yet.
     balance: Cell<isize>,
@@ -151,12 +156,18 @@ thread_local! {
     static IN_CALLBACK: Cell<bool> = const { Cell::new(false) };
 }
 
-/// Run `f` against this thread's state.
+/// Run `f` against this thread's state, which is `None` once the thread local
+/// has been destroyed.
 ///
-/// The state is `None` once the thread local has been destroyed, which is not an
-/// error: a thread's other thread locals are dropped after this one and go on
-/// allocating and freeing as they do it. Those calls still have to be accounted
-/// for, they just cannot be batched.
+/// Not the plain `with`, which panics on a destroyed thread local — and a panic
+/// unwinding out of [`GlobalAlloc`] is undefined behaviour.
+///
+/// The `None` arm is insurance rather than a path anything is known to take:
+/// `STATE` registers its destructor on a thread's first allocation, so where
+/// destructors run in reverse registration order it is the last thing dropped
+/// and nothing that allocates runs after it. That is the platform's decision to
+/// change, not ours, so the accounting handles the case rather than assuming it
+/// away.
 #[inline]
 fn with_state<R>(f: impl Fn(Option<&ThreadState>) -> R) -> R {
     let result = STATE.try_with(|state| f(Some(state)));

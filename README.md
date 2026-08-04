@@ -20,8 +20,8 @@ There are two levels, meant to be used together:
   else — dump a heap profile, shed load, drop buffers. Allocation carries on.
 
 * **`set_limit`** is a hard cap. Allocations that would take the process past it
-  fail, which — with an alloc error hook — becomes a panic you can catch at a
-  job boundary instead of an OOM kill you can't.
+  fail, which ends the process on your terms at a limit you chose rather than
+  the kernel's.
 
 ```rust
 THRESHER.set_threshold(3 * GIB);  // profile here
@@ -44,75 +44,19 @@ Here are a few uses:
 
 * [`examples/basic.rs`](examples/basic.rs) example for a bare bones version of this.
 * [`examples/jemalloc.rs`](examples/jemalloc.rs) for a way to wire up and have it dump a heap profile.
-* [`examples/hard_limit.rs`](examples/hard_limit.rs) for the hard cap end to end: a
-  worker that survives a job too big to run.
 
 ## The hard limit
 
-Past the limit, `alloc` returns null. On its own that means `handle_alloc_error`,
-which aborts — already better than an OOM kill, because you get a message on your
-own terms at a limit you chose, but still a dead process.
-
-To survive it, a process needs three things:
-
-1. **An alloc error hook that panics.** Panicking from inside the allocator is
-   undefined behaviour, but by the time the hook runs the allocator frame has
-   returned and you are in ordinary safe code. `take_refusal()` tells the hook
-   whether it was this limit or a genuine out of memory.
-
-2. **A `catch_unwind` at the job boundary**, so the panic fails one request
-   rather than the thread.
-
-3. **Room to breathe** — unwinding and reporting both allocate, so the limit
-   belongs below whatever will actually kill you. The first refusal on a thread
-   is one-shot for this reason: once refused, the thread is let through again so
-   it can unwind and report, and enforcement re-arms when the total drops back
-   under (or when you call `rearm_current_thread()`).
+Past the limit, `alloc` returns null, which means `handle_alloc_error` and an
+abort. That is better than an OOM kill — you find out at a limit you chose, on
+your own terms, while the machine is still healthy — but it is still the end of
+the process, so leave headroom between the threshold and the limit for the
+callback to do its work.
 
 `Enforcement::MarkedThreads` narrows the limit to threads you opt in with
 `mark_current_thread(true)` — usually the pool running user work, so the cap
-fails a query rather than your logging. Every thread is still accounted for
+fails on a query rather than on your logging. Every thread is still accounted for
 either way.
-
-```bash
-cargo run --example hard_limit --features alloc-error-hook
-```
-
-```text
-small-scan: ok, touched 8 MiB
-[thresher] threshold reached at 96 MiB
-heavy-aggregate: ok, touched 96 MiB
-runaway-join: refused (thresher refused an allocation of 536870912 bytes (536872064 bytes allocated))
-small-scan-again: ok, touched 8 MiB
-
-still running, 1 KiB allocated
-```
-
-### Stable or nightly?
-
-**Thresher is stable Rust, and the default build has no nightly anything in it.**
-`set_alloc_error_hook` is the one unstable piece, and `#![feature(..)]` gates
-apply to the crate that uses them — so the requirement lands on whoever calls it,
-not on everybody.
-
-| | needs | you get |
-| --- | --- | --- |
-| default | stable | threshold callback, accounting, and a hard limit that **aborts** — with your message, at your limit |
-| write your own hook | `#![feature(alloc_error_hook)]` in *your* crate root, so nightly | the limit becomes a catchable panic, with full control over the message |
-| `features = ["alloc-error-hook"]` | nightly to build | `thresher::install_alloc_error_hook()` does it for you — **your crate needs no `#![feature]`** |
-
-The refusal is recorded in a thread local rather than on the allocator, so the
-hook needs to capture nothing and thresher can install it on your behalf. That
-moves the feature gate into thresher's crate root instead of yours.
-
-Aborting is not nothing, if you would rather stay on stable: you find out at a
-limit you chose, on your own terms, with a message you wrote, instead of the
-kernel removing the process silently. You just do not get to keep serving.
-
-`RUSTC_BOOTSTRAP=1` will make a stable compiler accept the feature gate. It is
-the compiler's internal bootstrap escape hatch rather than a supported route, and
-it can break without notice — fine for a spike, worth deciding deliberately
-before it reaches production.
 
 ## Accounting & overhead
 
@@ -123,7 +67,8 @@ Each thread keeps its own balance and only reconciles with the shared total once
 it has drifted by 64 KiB, the same trick allocators use to keep their arenas
 thread local. A single shared counter that every thread has to write to
 serialises all of them on one cache line, which shows up as soon as more than
-one thread allocates at a time.
+one thread allocates at a time. A thread hands back whatever it is still holding
+when it exits, so threads coming and going do not make the total drift.
 
 Two consequences worth knowing about:
 

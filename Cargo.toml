@@ -19,17 +19,6 @@ jemalloc_pprof = { version = "0.8.0", features = ["symbolize"]}
 tokio = { version = "1.47.1", features = ["full"] }
 criterion = { version = "0.7.0", default-features = false, features = ["cargo_bench_support"] }
 
-[features]
-# Adds `thresher::install_alloc_error_hook`, which turns a hard-limit refusal
-# into a catchable panic. `set_alloc_error_hook` is still unstable, so this needs
-# a nightly compiler — but only for whoever enables it. Off by default, and the
-# crate is stable Rust without it.
-alloc-error-hook = []
-
-[[example]]
-name = "hard_limit"
-required-features = ["alloc-error-hook"]
-
 [[bench]]
 name = "system"
 harness = false

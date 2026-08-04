@@ -5,7 +5,7 @@ use thresher::Thresher;
 static THRESHER: Thresher<alloc::System> = Thresher::new(alloc::System);
 
 fn main() {
-    THRESHER.set_threshold(100 * 1024 * 1024);
+    THRESHER.set_callback_threshold(100 * 1024 * 1024);
     THRESHER.set_callback(|allocation| {
         println!("Threshold reached! Allocated: {} bytes", allocation);
     });

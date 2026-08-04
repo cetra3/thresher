@@ -8,6 +8,16 @@
 //! than the allocator it delegates to, so a `thresher/*` figure at or below its
 //! `system/*` counterpart means the harness has stopped measuring allocation.
 //!
+//! It only holds for workloads that leave the heap as they found it, which is
+//! why these allocate and immediately free. The two targets are separate
+//! binaries with separate heaps, so a workload whose cost depends on what the
+//! allocator has lying around — anything built on `realloc`, in particular —
+//! ends up comparing one heap's history against the other's, and that
+//! difference is larger than the accounting being measured. A `realloc`
+//! workload measured here came out 7% *faster* under the wrapper, with
+//! non-overlapping intervals; there is no block size that escapes it, so the
+//! path is left to the unit tests rather than benchmarked badly.
+//!
 //! `contention/1` and `alloc_free` are both one thread allocating in a loop, so
 //! their per-op costs should land in the same ballpark — but not agree exactly.
 //! They use different sizes, and a tight loop lets the wrapper's thread-local
@@ -35,16 +45,6 @@ fn alloc_free(size: usize) {
     drop(black_box(v));
 }
 
-/// Push `n` elements onto an empty vec, exercising the `realloc` path.
-#[inline]
-fn vec_grow(n: usize) {
-    let mut v: Vec<u64> = Vec::new();
-    for i in 0..n {
-        v.push(i as u64);
-    }
-    black_box(&v);
-}
-
 /// Hold `count` live allocations of `size` bytes at once, then drop them all.
 ///
 /// `vec![0u8; n]` goes through `alloc_zeroed`, and keeping the blocks live means
@@ -70,9 +70,6 @@ fn bench_alloc_free(c: &mut Criterion, prefix: &str) {
 }
 
 fn bench_patterns(c: &mut Criterion, prefix: &str) {
-    c.bench_function(&format!("{prefix}/vec_grow/4096"), |b| {
-        b.iter(|| vec_grow(4096));
-    });
     c.bench_function(&format!("{prefix}/batch_retain/1024x256"), |b| {
         b.iter(|| batch_retain(1024, 256));
     });
@@ -84,7 +81,7 @@ fn bench_patterns(c: &mut Criterion, prefix: &str) {
 /// serialises every thread on that cache line, so the per-op cost should climb
 /// with the thread count even though the threads share no data of their own.
 ///
-/// Each worker clocks its own loop and the sample is the slowest of them. Timing
+/// Each worker clocks its own loop and the sample is the mean of them. Timing
 /// the whole group from this thread instead — start the clock, wait on a finish
 /// barrier — folds `thread::spawn` and the workers' barrier wake-up skew into the
 /// measurement, and both of those grow with the thread count. That reads as

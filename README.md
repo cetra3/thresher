@@ -1,6 +1,7 @@
 # Thresher
 
-A memory allocation wrapper that hits a callback when a threshold is reached:
+Thresher is a wrapper for a memory allocator. It calls your callback when the
+memory in use goes above a threshold.
 
 ```rust
 #[global_allocator]
@@ -14,98 +15,92 @@ fn main() {
 }
 ```
 
-There are two levels, meant to be used together:
+Thresher has two levels. Use them together.
 
-* **`set_callback_threshold`** is advisory. Crossing it runs your callback and nothing
-  else — dump a heap profile, shed load, drop buffers. Allocation carries on.
-
-* **`set_hard_limit`** refuses. Allocations that would take the process past it
-  fail, which ends the process on your terms at a figure you chose rather than
-  the kernel's.
+* `set_callback_threshold` is advisory. Thresher calls your callback. The
+  allocation continues.
+* `set_hard_limit` refuses. Thresher fails each allocation that goes above the
+  limit.
 
 ```rust
-THRESHER.set_callback_threshold(3 * GIB);  // profile here
+THRESHER.set_callback_threshold(3 * GIB);      // profile here
 THRESHER.set_hard_limit(3 * GIB + 512 * MIB);  // refuse here
 ```
 
-## Upgrading from 0.1
+## Changes in 0.2
 
-`set_threshold` / `get_threshold` are now `set_callback_threshold` /
-`get_callback_threshold`, and the hard limit added alongside them is
-`set_hard_limit` / `get_hard_limit`. Two settings both spelled "a number of
-bytes you care about" needed names that said which one refuses.
+`set_threshold` and `get_threshold` are now `set_callback_threshold` and
+`get_callback_threshold`. The hard limit is `set_hard_limit` and
+`get_hard_limit`. The two settings are both a number of bytes, thus the names
+must tell you which one refuses.
 
-`get_allocated()` also changed behaviour without changing signature: it is now
-approximate, lagging by up to 64 KiB per running thread, because the accounting
-is batched per thread rather than hitting one shared atomic on every allocation.
-See [Accounting & overhead](#accounting--overhead). If you were alerting on that
-number, `flush()` folds in the calling thread's balance.
+`get_allocated()` is now approximate. It can lag by a maximum of 64 KiB for each
+thread. The signature is the same. See [Accounting](#accounting).
 
 ## Motivation
 
-While there are crates to limit and cap memory usage, there are occasions where you want to know what's going on before ending the process.  However, running any sort of diagnostic may require you to allocate *more* memory, which means you do need a little bit of headroom in order to have this be useful. This is what this library is for: having a threshold of memory usage, after which actions can be taken to either reduce memory or provide enough information to know what's going on.
+Other crates limit the memory in use. They do not tell you what occurred before
+the process stops. A diagnostic must allocate more memory. Thus you must keep
+some memory free to run it.
 
-Here are a few uses:
+Thresher gives you a threshold. When the memory in use goes above the threshold,
+your callback can decrease the memory or record the cause.
 
-* if you have processes that are being killed by OOM, then you may want to record a heap profile of what's happening.  I.e, set the threshold to 90% of available memory, and have it write a heap dump. This is essentially the main motivation for this library.
+Examples of use:
 
-* Another situation may be to provide some back pressure or slow down requests to prevent an OOM in the first place.  I.e, if things are happening too quickly.
-
-* You could also use this threshold as an opportunity to dump buffers/drop potential memory hogs.  I.e, `reqwest/hyper` have write buffers that are [never sized down](https://github.com/hyperium/hyper/issues/1790).
+* Write a heap profile before an OOM kill. Set the threshold to 90% of the
+  memory available.
+* Apply back pressure. Slow down or refuse new requests.
+* Release large buffers. `reqwest` and `hyper` keep write buffers at their
+  maximum size ([hyper#1790](https://github.com/hyperium/hyper/issues/1790)).
 
 ## Examples
 
-* [`examples/basic.rs`](examples/basic.rs) example for a bare bones version of this.
-* [`examples/jemalloc.rs`](examples/jemalloc.rs) for a way to wire up and have it dump a heap profile.
+* [`examples/basic.rs`](examples/basic.rs) is the minimum version.
+* [`examples/jemalloc.rs`](examples/jemalloc.rs) writes a heap profile.
 
 ## The hard limit
 
-Past the limit, `alloc` returns null, which means `handle_alloc_error` and an
-abort. That is better than an OOM kill — you find out at a figure you chose, on
-your own terms, while the machine is still healthy — but it is still the end of
-the process, and the abort message is the allocator's standard
-`memory allocation of N bytes failed` rather than anything of ours. Leave
-headroom between the threshold and the limit for the callback to do its work.
+If an allocation goes above the hard limit, `alloc` returns null. Rust then
+calls `handle_alloc_error`, which stops the process. This is better than an OOM
+kill, because the limit is yours and the machine stays serviceable. But the
+process stops. Keep memory free between the threshold and the limit for the
+callback. The message is the standard Rust message,
+`memory allocation of N bytes failed`.
 
-To survive a refusal rather than die of it, allocate fallibly: `Vec::try_reserve`
-and friends turn the null into an `Err` instead of reaching `handle_alloc_error`
-at all, so the request that overran the limit fails while the process carries on.
+To continue after a refusal, use `Vec::try_reserve` or an equivalent function.
+These functions return an `Err`. They do not call `handle_alloc_error`.
 
-`Enforcement::MarkedThreads` narrows the limit to threads you opt in with
-`mark_current_thread(true)` — usually the pool running user work, so the limit
-fails on a query rather than on your logging. Every thread is still accounted for
-either way.
+`Enforcement::MarkedThreads` applies the limit only to the threads that call
+`mark_current_thread(true)`. Use it for the threads that do user work. Thresher
+counts the memory of all threads in all conditions.
 
-The limit is not exact. It is compared against the shared total, which lags by up
-to 64 KiB per *other* running thread, and nothing locks between the check and the
-allocation, so concurrent threads can each pass a check only one of them would
-have passed in sequence. Both errors run the same way — the process can sit
-somewhat above the limit — so set it far enough below the ceiling you genuinely
-cannot cross that a few hundred kilobytes of slack does not matter.
+The hard limit is not exact. Thresher compares the limit with the shared total.
+The shared total lags by a maximum of 64 KiB for each other thread. Thresher
+does not lock between the comparison and the allocation. Thus two threads can go
+above the limit together. Set the limit a minimum of a few hundred kilobytes
+below the maximum that the process must not exceed.
 
-## Accounting & overhead
+## Accounting
 
-Every allocation in the process goes through this wrapper, so the accounting has
-to be close to free or it becomes the bottleneck it is supposed to be watching.
+Each allocation in the process goes through Thresher. Thus the accounting must
+be fast.
 
-Each thread keeps its own balance and only reconciles with the shared total once
-it has drifted by 64 KiB, the same trick allocators use to keep their arenas
-thread local. A single shared counter that every thread has to write to
-serialises all of them on one cache line, which shows up as soon as more than
-one thread allocates at a time. A thread hands back whatever it is still holding
-when it exits, so threads coming and going do not make the total drift.
+Each thread keeps its own balance. The thread adds its balance to the shared
+total only when the balance goes above 64 KiB. One shared counter makes all
+threads write to one cache line, which is slow. When a thread stops, it adds its
+balance to the shared total.
 
-Two consequences worth knowing about:
+There are two results:
 
-* `get_allocated()` is approximate — it can lag by up to 64 KiB per running
-  thread. Call `flush()` if you need the calling thread's balance folded in.
-  Allocations larger than 64 KiB always reconcile immediately, so a single big
-  allocation is never hidden.
+* `get_allocated()` is approximate. It can lag by a maximum of 64 KiB for each
+  thread. Call `flush()` to add the balance of the current thread. Thresher
+  records each allocation of more than 64 KiB immediately.
 
-* Only what is requested through `GlobalAlloc` is visible. An allocator holding
-  freed pages, or mapping an arena up front, is not. If you need the real
-  resident figure, poll it out of band and feed it back with `set_allocated()`,
-  which will trip the threshold in its own right:
+* Thresher sees only the requests through `GlobalAlloc`. It does not see the
+  free pages that the allocator keeps, or an arena. For the true resident
+  memory, read the value from the operating system and give it to
+  `set_allocated()`:
 
   ```rust
   std::thread::spawn(|| loop {
@@ -114,10 +109,11 @@ Two consequences worth knowing about:
   });
   ```
 
-The callback runs inside the allocator, on whichever thread crossed the
-threshold. It may allocate — that is what the headroom is for, and its
-allocations will not re-enter it — but it must not panic, because unwinding out
-of an allocation is undefined behaviour.
+The callback runs in the allocator, on the thread that went above the threshold.
+The callback can allocate memory, and Thresher does not call the callback again
+for those allocations. The hard limit does not apply to the callback, thus you
+must keep its allocations small. The callback must not panic, because a panic in
+an allocation is undefined behavior.
 
 ## Benchmarks
 
@@ -125,45 +121,37 @@ of an allocation is undefined behaviour.
 cargo bench
 ```
 
-Two targets run the same workloads, since a binary can only have one
-`#[global_allocator]`: `system` on the bare system allocator and `thresher`
-through the wrapper. Compare by benchmark id (`system/contention/8` against
-`thresher/contention/8`), and use `--save-baseline` / `--baseline` to compare a
-change against itself.
+There are two targets, because a program can have only one
+`#[global_allocator]`. The `system` target uses the system allocator. The
+`thresher` target uses the wrapper. Compare the two by benchmark id, for example
+`system/contention/8` against `thresher/contention/8`. Use `--save-baseline` and
+`--baseline` to compare a change with an earlier result.
 
-The contention benchmark is the one to watch — N threads allocating at once,
-sharing no data of their own. What matters there is not the size of the overhead
-but whether it *grows* with the thread count, because that is what a single
-shared counter would do. It doesn't:
+The `contention` benchmark is the important one. It runs N threads that allocate
+memory at the same time. The overhead must stay constant as N increases. One
+shared counter does not stay constant.
 
-Cost per alloc/free pair relative to the bare system allocator:
+Overhead for each alloc/free pair, above the system allocator:
 
 | threads | 1 | 2 | 4 | 8 |
 | --- | --- | --- | --- | --- |
-| per-thread batching | 1.14× | 1.11× | 1.09× | 1.14× |
-| one shared counter | 2.27× | 9.49× | 20.8× | 20.8× |
+| 0.2, one balance for each thread | 1.6 ns | 1.6 ns | 1.6 ns | 1.5 ns |
+| 0.1, one shared counter | 5.6 ns | 35.2 ns | 75.1 ns | 158.1 ns |
 
-Roughly a tenth on top of each allocation, flat across thread counts. The second
-row is the same crate before the accounting was made thread local — a single
-`AtomicUsize` taking a `fetch_add` on every allocation, which is what the batching
-exists to avoid. It costs 2.3× with one thread just for the atomic, and an order
-of magnitude more once threads start fighting over the cache line: 396 ns per
-alloc/free pair at 8 threads against the bare allocator's 19 ns.
+Measured on a 16-core AMD Ryzen 9 9950X3D with glibc 2.44. The overhead of 0.2
+is constant. The overhead of 0.1 increases with each thread, because all threads
+write to one cache line.
 
-The isolated per-allocation path (`alloc_free`) costs around 1.4×, more than the
-contention figure, because there the bookkeeping cannot amortise across a loop.
-In absolute terms it is ~4 ns per alloc/free pair at 16 B and 1 KiB and ~6 ns at
-64 KiB — near enough flat in nanoseconds, though not as a ratio, since the
-underlying allocation gets dearer with size.
+The `alloc_free` benchmark has no loop to amortize the accounting. Its overhead
+is 2.0 ns for 16 B and 1 KiB, and 2.8 ns for 64 KiB.
 
-Two caveats on reading these. Thread counts above the machine's core count
-measure oversubscription rather than contention — throughput flattens once the
-cores are saturated no matter what the allocator does. And absolute nanosecond
-figures are not portable between machines: the same binaries measured 10 ns and
-17 ns per `malloc` on two different cloud hosts, so compare ratios from a single
-interleaved run rather than numbers from different sittings. Run-to-run spread on
-the ratio is a few percent; if you need tighter, raise `--measurement-time` and
-`--sample-size`.
+Two limits on these results:
+
+* Do not compare times from different machines. The same code measured 1.6 ns of
+  overhead here and approximately 2 ns on a 4-core Xeon. The ratio to the system
+  allocator changes more. A fast allocator makes the same overhead a larger part
+  of the total.
+* More threads than cores measures oversubscription, not contention.
 
 ## License
 

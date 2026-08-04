@@ -1,6 +1,6 @@
 [package]
 name = "thresher"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2024"
 authors = ["cetra3 <cetra3@hotmail.com>"]
 description = "Execute a callback when a memory threshold is reached"
@@ -9,8 +9,6 @@ repository = "https://github.com/cetra3/thresher"
 readme = "README.md"
 keywords = ["allocator", "memory"]
 categories = ["memory-management"]
-# `benches/common.rs` is a shared module, not a bench target of its own
-autobenches = false
 
 
 [dev-dependencies]

@@ -84,7 +84,7 @@ fn bench_patterns(c: &mut Criterion, prefix: &str) {
 /// serialises every thread on that cache line, so the per-op cost should climb
 /// with the thread count even though the threads share no data of their own.
 ///
-/// Each worker clocks its own loop and the sample is the slowest of them. Timing
+/// Each worker clocks its own loop and the sample is the mean of them. Timing
 /// the whole group from this thread instead — start the clock, wait on a finish
 /// barrier — folds `thread::spawn` and the workers' barrier wake-up skew into the
 /// measurement, and both of those grow with the thread count. That reads as

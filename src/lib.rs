@@ -11,7 +11,7 @@
 //! fn main() {
 //!
 //!     // Set the threshold we care about reaching
-//!     THRESHER.set_threshold(100 * 1024 * 1024);
+//!     THRESHER.set_callback_threshold(100 * 1024 * 1024);
 //!
 //!     // Set the callback when the threshold is reached (note: may be called multiple times)
 //!     THRESHER.set_callback(|allocation| {
@@ -46,15 +46,15 @@
 //! can poll it out of band (`/proc/self/statm`, or your allocator's own stats)
 //! and feed it back in with [`Thresher::set_allocated`].
 //!
-//! # Two limits
+//! # Two levels
 //!
 //! There are two independent levels, and they are meant to be used together:
 //!
-//! * The **threshold** ([`Thresher::set_threshold`]) is advisory. Crossing it
-//!   runs your callback and nothing else — dump a heap profile, shed load, drop
-//!   caches. Allocation carries on.
+//! * The **callback threshold** ([`Thresher::set_callback_threshold`]) is
+//!   advisory. Crossing it runs your callback and nothing else — dump a heap
+//!   profile, shed load, drop caches. Allocation carries on.
 //!
-//! * The **limit** ([`Thresher::set_limit`]) is a hard cap. Allocations that
+//! * The **hard limit** ([`Thresher::set_hard_limit`]) refuses. Allocations that
 //!   would take the process past it fail: [`GlobalAlloc::alloc`] returns null,
 //!   and Rust turns that into `handle_alloc_error`.
 //!
@@ -66,9 +66,22 @@
 //! # use thresher::Thresher;
 //! # #[global_allocator]
 //! # static THRESHER: Thresher<alloc::System> = Thresher::new(alloc::System);
-//! THRESHER.set_threshold(3 * 1024 * 1024 * 1024); // profile at 3 GiB
-//! THRESHER.set_limit(3 * 1024 * 1024 * 1024 + 512 * 1024 * 1024); // refuse at 3.5 GiB
+//! THRESHER.set_callback_threshold(3 * 1024 * 1024 * 1024); // profile at 3 GiB
+//! THRESHER.set_hard_limit(3 * 1024 * 1024 * 1024 + 512 * 1024 * 1024); // refuse at 3.5 GiB
 //! ```
+//!
+//! # Scope
+//!
+//! The running total is process wide, not per instance: it lives in a `static`,
+//! because a thread that exits has to fold its outstanding balance back in from
+//! a thread local destructor, which has no way back to the allocator it was
+//! accounting for. Only one allocator can be the `#[global_allocator]`, so there
+//! is only one total worth keeping.
+//!
+//! The practical consequence is that a `Thresher` which is *not* the global
+//! allocator — one wrapping a sub-allocator to measure a single subsystem, say —
+//! still reports and limits the whole process. [`Thresher::mark_current_thread`] is
+//! likewise a property of the thread rather than of the instance.
 
 use std::{
     alloc::{GlobalAlloc, Layout},
@@ -187,18 +200,17 @@ fn add_allocated(size: usize) -> usize {
     ALLOCATED.fetch_add(size, Ordering::Relaxed)
 }
 
-/// Subtract from the shared total, returning what it is now.
+/// Subtract from the shared total.
 #[inline]
-fn sub_allocated(size: usize) -> usize {
+fn sub_allocated(size: usize) {
     // Saturating rather than a plain `fetch_sub`: a `set_allocated` resync can
     // leave the total lower than what is being credited back, and wrapping past
     // zero would leave the callback permanently tripped.
-    ALLOCATED
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |allocated| {
-            Some(allocated.saturating_sub(size))
-        })
-        .unwrap_or_else(|allocated| allocated)
-        .saturating_sub(size)
+    //
+    // The closure always returns `Some`, so this never fails.
+    let _ = ALLOCATED.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |allocated| {
+        Some(allocated.saturating_sub(size))
+    });
 }
 
 /// Which threads the hard limit is allowed to fail allocations on.
@@ -216,8 +228,8 @@ pub enum Enforcement {
 /// The main allocation wrapper. [`Thresher::new()`] to wrap an existing allocator
 pub struct Thresher<A> {
     allocator: A,
-    threshold: AtomicUsize,
-    limit: AtomicUsize,
+    callback_threshold: AtomicUsize,
+    hard_limit: AtomicUsize,
     marked_threads_only: AtomicBool,
     callback: OnceLock<Box<dyn Fn(usize) + Send + Sync>>,
 }
@@ -242,8 +254,8 @@ impl<A> Thresher<A> {
     pub const fn new(allocator: A) -> Self {
         Self {
             allocator,
-            threshold: AtomicUsize::new(usize::MAX),
-            limit: AtomicUsize::new(usize::MAX),
+            callback_threshold: AtomicUsize::new(usize::MAX),
+            hard_limit: AtomicUsize::new(usize::MAX),
             marked_threads_only: AtomicBool::new(false),
             callback: OnceLock::new(),
         }
@@ -260,12 +272,12 @@ impl<A> Thresher<A> {
     /// # #[global_allocator]
     /// # static THRESHER: Thresher<alloc::System> = Thresher::new(alloc::System);
     /// fn main() {
-    ///     THRESHER.set_threshold(100 * 1024 * 1024);
+    ///     THRESHER.set_callback_threshold(100 * 1024 * 1024);
     /// }
     /// ```
     ///
-    pub fn set_threshold(&self, threshold: usize) {
-        self.threshold.store(threshold, Ordering::Release);
+    pub fn set_callback_threshold(&self, threshold: usize) {
+        self.callback_threshold.store(threshold, Ordering::Release);
     }
 
     /// Set the callback to execute when the threshold is reached.
@@ -283,7 +295,11 @@ impl<A> Thresher<A> {
     ///   holds while it is itself allocating will deadlock.
     ///
     /// The callback is free to allocate — that is what the headroom below the
-    /// threshold is for — and allocations it makes will not re-enter it.
+    /// threshold is for — and allocations it makes will not re-enter it, nor are
+    /// they refused by [`set_hard_limit`](Thresher::set_hard_limit): the callback
+    /// runs precisely because memory is tight, so refusing it would defeat the
+    /// point. That exemption is unbounded, so keep what the callback allocates
+    /// bounded.
     ///
     /// Panics if set more than once.
     /// ```rust
@@ -317,38 +333,57 @@ impl<A> Thresher<A> {
     }
 
     /// Returns the current threshold.
-    pub fn get_threshold(&self) -> usize {
-        self.threshold.load(Ordering::Acquire)
+    pub fn get_callback_threshold(&self) -> usize {
+        self.callback_threshold.load(Ordering::Acquire)
     }
 
-    /// Set the hard `limit` in bytes, above which allocations start failing.
+    /// Set the hard limit in bytes, above which allocations start failing.
     ///
-    /// Where [`set_threshold`](Thresher::set_threshold) asks nicely, this one
-    /// says no: an allocation that would take the process past the limit gets a
-    /// null pointer back. Set it to `usize::MAX` (the default) to disable.
+    /// Where [`set_callback_threshold`](Thresher::set_callback_threshold) asks
+    /// nicely, this one says no: an allocation that would take the process past
+    /// the limit gets a null pointer back. Set it to `usize::MAX` (the default) to
+    /// disable.
     ///
     /// A null from the allocator means `handle_alloc_error`, which aborts. That
-    /// is a better death than being OOM killed — it happens at a limit you
-    /// chose, with a message, while the rest of the machine is still healthy —
-    /// but it is still the end of the process. Leave room between the threshold
-    /// and the limit so the callback has somewhere to do its work, and consider
+    /// is a better death than being OOM killed — it happens at a figure you
+    /// chose, while the rest of the machine is still healthy — but it is still
+    /// the end of the process, and the abort message is the standard
+    /// `memory allocation of N bytes failed` rather than anything of ours. Leave
+    /// room between the threshold and the limit so the callback has somewhere to
+    /// do its work, and consider
     /// [`set_enforcement`](Thresher::set_enforcement) so the limit fails the work
     /// you can afford to lose rather than your logging.
+    ///
+    /// To handle a refusal rather than die of it, allocate fallibly:
+    /// [`Vec::try_reserve`] and friends turn the null into an `Err` instead of
+    /// reaching `handle_alloc_error` at all, which is what makes
+    /// [`Enforcement::MarkedThreads`] worth pairing this with.
+    ///
+    /// # The limit is not exact
+    ///
+    /// The comparison is against the shared total, which lags by up to
+    /// [`RECONCILE_BATCH`] bytes per *other* running thread (this thread's own
+    /// outstanding balance is counted). Nothing locks between the check and the
+    /// allocation either, so concurrent threads can each pass a check that only
+    /// one of them would have passed in sequence. Both errors are in the same
+    /// direction — the process can sit somewhat above the limit — so set it far
+    /// enough below the ceiling you actually cannot cross that a few hundred
+    /// kilobytes of slack does not matter.
     ///
     /// ```rust
     /// # use std::alloc;
     /// # use thresher::Thresher;
     /// # #[global_allocator]
     /// # static THRESHER: Thresher<alloc::System> = Thresher::new(alloc::System);
-    /// THRESHER.set_limit(4 * 1024 * 1024 * 1024);
+    /// THRESHER.set_hard_limit(4 * 1024 * 1024 * 1024);
     /// ```
-    pub fn set_limit(&self, limit: usize) {
-        self.limit.store(limit, Ordering::Release);
+    pub fn set_hard_limit(&self, hard_limit: usize) {
+        self.hard_limit.store(hard_limit, Ordering::Release);
     }
 
     /// Returns the current hard limit.
-    pub fn get_limit(&self) -> usize {
-        self.limit.load(Ordering::Acquire)
+    pub fn get_hard_limit(&self) -> usize {
+        self.hard_limit.load(Ordering::Acquire)
     }
 
     /// Choose which threads the hard limit may fail allocations on.
@@ -449,7 +484,7 @@ impl<A> Thresher<A> {
     /// });
     /// ```
     pub fn set_allocated(&self, allocated: usize) {
-        let threshold = self.threshold.load(Ordering::Relaxed);
+        let threshold = self.callback_threshold.load(Ordering::Relaxed);
         let previous = ALLOCATED.swap(allocated, Ordering::Relaxed);
 
         if allocated >= threshold && previous < threshold {
@@ -464,21 +499,17 @@ impl<A> Thresher<A> {
     /// a clean copy of that line — and a comparison against a constant.
     #[inline]
     fn should_refuse(&self, state: Option<&ThreadState>, size: usize) -> bool {
-        if self.limit.load(Ordering::Relaxed) == usize::MAX {
+        let hard_limit = self.hard_limit.load(Ordering::Relaxed);
+
+        if hard_limit == usize::MAX {
             return false;
         }
 
-        self.refusal_check(state, size)
+        self.refusal_check(state, size, hard_limit)
     }
 
     #[inline(never)]
-    fn refusal_check(&self, state: Option<&ThreadState>, size: usize) -> bool {
-        let limit = self.limit.load(Ordering::Relaxed);
-
-        if limit == usize::MAX {
-            return false;
-        }
-
+    fn refusal_check(&self, state: Option<&ThreadState>, size: usize, hard_limit: usize) -> bool {
         // The threshold callback exists to run when memory is tight; refusing
         // its allocations would defeat the point of leaving headroom for it.
         if IN_CALLBACK.with(|in_callback| in_callback.get()) {
@@ -498,7 +529,7 @@ impl<A> Thresher<A> {
             .saturating_add(state.map_or(0, |state| state.balance.get().max(0) as usize))
             .saturating_add(size);
 
-        projected >= limit
+        projected >= hard_limit
     }
 
     /// Debit this thread's balance, reconciling if it has drifted far enough.
@@ -543,7 +574,7 @@ impl<A> Thresher<A> {
     fn reconcile_alloc(&self, size: usize) {
         // Relaxed: nothing is published through the threshold, and this is read
         // once per reconcile on every thread that allocates.
-        let threshold = self.threshold.load(Ordering::Relaxed);
+        let threshold = self.callback_threshold.load(Ordering::Relaxed);
         let old_allocated = add_allocated(size);
         let new_allocated = old_allocated.saturating_add(size);
 
@@ -707,6 +738,41 @@ mod tests {
         }
     }
 
+    /// Resize a block from `from` to `to` through `realloc` with the limit armed
+    /// behind us, reporting whether the resize was refused.
+    ///
+    /// The seed block is allocated *before* the limit goes up, so what is under
+    /// test is the resize rather than the original allocation, and the block is
+    /// freed after it comes down. Nothing between the two allocates: a panic in
+    /// that window would allocate its payload, be refused, and abort the test
+    /// binary rather than fail a test.
+    fn probe_realloc(from: usize, to: usize) -> bool {
+        let layout = Layout::from_size_align(from, 16).expect("valid layout");
+        let resized_layout = Layout::from_size_align(to, 16).expect("valid layout");
+
+        // SAFETY: allocated here, resized and freed with the layout it currently
+        // has, and never read from.
+        unsafe {
+            let ptr = ALLOCATOR.alloc(layout);
+            assert!(!ptr.is_null(), "the seed allocation was refused");
+
+            arm_limit_behind_us();
+            let resized = ALLOCATOR.realloc(ptr, layout, to);
+            let refused = resized.is_null();
+            disarm_limit();
+
+            // `realloc` returning null has to leave the original block valid, so
+            // on refusal it is still ours to free under its original layout.
+            if refused {
+                ALLOCATOR.dealloc(ptr, layout);
+            } else {
+                ALLOCATOR.dealloc(resized, resized_layout);
+            }
+
+            refused
+        }
+    }
+
     /// Serialise against the other tests, register the shared callback, and
     /// start from a disarmed threshold and limit with no recorded fires.
     fn setup() -> MutexGuard<'static, ()> {
@@ -714,8 +780,8 @@ mod tests {
 
         let guard = TEST_LOCK.lock().unwrap_or_else(|err| err.into_inner());
 
-        ALLOCATOR.set_threshold(usize::MAX);
-        ALLOCATOR.set_limit(usize::MAX);
+        ALLOCATOR.set_callback_threshold(usize::MAX);
+        ALLOCATOR.set_hard_limit(usize::MAX);
         ALLOCATOR.set_enforcement(Enforcement::AllThreads);
         ALLOCATOR.mark_current_thread(false);
 
@@ -754,13 +820,13 @@ mod tests {
         ALLOCATOR.set_enforcement(Enforcement::MarkedThreads);
         ALLOCATOR.mark_current_thread(true);
         ALLOCATOR.flush();
-        ALLOCATOR.set_limit(ALLOCATOR.get_allocated().saturating_sub(1));
+        ALLOCATOR.set_hard_limit(ALLOCATOR.get_allocated().saturating_sub(1));
     }
 
     /// Undo [`arm_limit_behind_us`]. Nothing on this thread may allocate between
     /// the two.
     fn disarm_limit() {
-        ALLOCATOR.set_limit(usize::MAX);
+        ALLOCATOR.set_hard_limit(usize::MAX);
         ALLOCATOR.set_enforcement(Enforcement::AllThreads);
         ALLOCATOR.mark_current_thread(false);
     }
@@ -770,7 +836,7 @@ mod tests {
         let _guard = setup();
 
         ALLOCATOR.flush();
-        ALLOCATOR.set_threshold(ALLOCATOR.get_allocated() + 8 * 1024 * 1024);
+        ALLOCATOR.set_callback_threshold(ALLOCATOR.get_allocated() + 8 * 1024 * 1024);
         assert_eq!(fires(), 0);
 
         let held = vec![0u8; 16 * 1024 * 1024];
@@ -787,7 +853,7 @@ mod tests {
         let _guard = setup();
 
         ALLOCATOR.flush();
-        ALLOCATOR.set_threshold(ALLOCATOR.get_allocated() + 64 * 1024 * 1024);
+        ALLOCATOR.set_callback_threshold(ALLOCATOR.get_allocated() + 64 * 1024 * 1024);
 
         let held = vec![0u8; 8 * 1024 * 1024];
         assert_eq!(fires(), 0);
@@ -954,11 +1020,11 @@ mod tests {
         let _guard = setup();
 
         ALLOCATOR.flush();
-        ALLOCATOR.set_limit(ALLOCATOR.get_allocated() + 64 * 1024 * 1024);
+        ALLOCATOR.set_hard_limit(ALLOCATOR.get_allocated() + 64 * 1024 * 1024);
 
         let refused = probe(4 * RECONCILE_BATCH);
 
-        ALLOCATOR.set_limit(usize::MAX);
+        ALLOCATOR.set_hard_limit(usize::MAX);
 
         assert!(!refused, "an allocation under the hard limit was refused");
     }
@@ -972,12 +1038,35 @@ mod tests {
         ALLOCATOR.set_enforcement(Enforcement::MarkedThreads);
         ALLOCATOR.mark_current_thread(true);
         ALLOCATOR.flush();
-        ALLOCATOR.set_limit(ALLOCATOR.get_allocated() + 1024 * 1024);
+        ALLOCATOR.set_hard_limit(ALLOCATOR.get_allocated() + 1024 * 1024);
 
         let refused = probe(64 * 1024 * 1024);
         disarm_limit();
 
         assert!(refused, "an allocation straight past the limit was served");
+    }
+
+    /// Growing through `realloc` is refused the same as a fresh allocation, and
+    /// the block being grown survives the refusal — `realloc` is required to
+    /// leave it valid when it returns null.
+    #[test]
+    fn hard_limit_refuses_growth_through_realloc() {
+        let _guard = setup();
+
+        let refused = probe_realloc(16, 4 * RECONCILE_BATCH);
+
+        assert!(refused, "a realloc past the hard limit was served");
+    }
+
+    /// Shrinking cannot take the process further over, so it is never refused —
+    /// even from behind an armed limit.
+    #[test]
+    fn hard_limit_allows_shrinking_through_realloc() {
+        let _guard = setup();
+
+        let refused = probe_realloc(4 * RECONCILE_BATCH, 16);
+
+        assert!(!refused, "shrinking was refused by the hard limit");
     }
 
     /// Coming back down under the limit lifts it again, with nothing to call.
@@ -989,13 +1078,16 @@ mod tests {
         let refused = probe(4 * RECONCILE_BATCH);
 
         // What unwinding does: release what the failed work was holding.
-        ALLOCATOR.set_limit(ALLOCATOR.get_allocated() + 64 * 1024 * 1024);
+        ALLOCATOR.set_hard_limit(ALLOCATOR.get_allocated() + 64 * 1024 * 1024);
         let recovered = probe(4 * RECONCILE_BATCH);
 
         disarm_limit();
 
         assert!(refused, "an allocation past the hard limit was served");
-        assert!(!recovered, "the limit kept refusing after dropping under it");
+        assert!(
+            !recovered,
+            "the limit kept refusing after dropping under it"
+        );
     }
 
     #[test]
@@ -1004,7 +1096,7 @@ mod tests {
 
         ALLOCATOR.set_enforcement(Enforcement::MarkedThreads);
         ALLOCATOR.flush();
-        ALLOCATOR.set_limit(ALLOCATOR.get_allocated().saturating_sub(1));
+        ALLOCATOR.set_hard_limit(ALLOCATOR.get_allocated().saturating_sub(1));
 
         let unmarked = probe(4 * RECONCILE_BATCH);
         ALLOCATOR.mark_current_thread(true);
@@ -1029,14 +1121,14 @@ mod tests {
 
         ALLOCATOR.flush();
         let baseline = ALLOCATOR.get_allocated();
-        ALLOCATOR.set_threshold(baseline + 1024 * 1024);
-        ALLOCATOR.set_limit(baseline + 1024 * 1024);
+        ALLOCATOR.set_callback_threshold(baseline + 1024 * 1024);
+        ALLOCATOR.set_hard_limit(baseline + 1024 * 1024);
 
         // Trips both at once, so the callback runs while over the limit.
         ALLOCATOR.set_allocated(baseline + 2 * 1024 * 1024);
 
         disarm_limit();
-        ALLOCATOR.set_threshold(usize::MAX);
+        ALLOCATOR.set_callback_threshold(usize::MAX);
         ALLOCATOR.set_allocated(baseline);
 
         assert_eq!(fires(), 1);
@@ -1052,14 +1144,14 @@ mod tests {
 
         ALLOCATOR.flush();
         let baseline = ALLOCATOR.get_allocated();
-        ALLOCATOR.set_threshold(baseline + 1024 * 1024);
+        ALLOCATOR.set_callback_threshold(baseline + 1024 * 1024);
         assert_eq!(fires(), 0);
 
         ALLOCATOR.set_allocated(baseline + 2 * 1024 * 1024);
         assert_eq!(fires(), 1);
 
         // Put the shared total back so the next test starts from something real.
-        ALLOCATOR.set_threshold(usize::MAX);
+        ALLOCATOR.set_callback_threshold(usize::MAX);
         ALLOCATOR.set_allocated(baseline);
     }
 }

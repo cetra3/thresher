@@ -12,7 +12,17 @@ env:
 jobs:
   build:
 
-    runs-on: ubuntu-latest
+    # macOS is not redundant here. The per-thread accounting keeps its state in a
+    # thread local with a `Drop` impl, so the first allocation on every thread
+    # registers a destructor — and on macOS that goes through `_tlv_atexit`,
+    # which allocates, re-entering the allocator mid-initialisation. It does not
+    # nest on glibc; this is what checks the claim on the platform where it is
+    # least obviously true.
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
 
     steps:
     - uses: actions/checkout@v4

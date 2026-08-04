@@ -7,7 +7,6 @@ use criterion::{Criterion, criterion_group, criterion_main};
 #[global_allocator]
 static ALLOCATOR: std::alloc::System = std::alloc::System;
 
-#[path = "common.rs"]
 mod common;
 
 fn benches(c: &mut Criterion) {

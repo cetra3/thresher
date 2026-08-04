@@ -7,7 +7,7 @@ A memory allocation wrapper that hits a callback when a threshold is reached:
 static ALLOCATOR: Thresher<alloc::System> = Thresher::new(alloc::System);
 
 fn main() {
-    ALLOCATOR.set_threshold(100 * 1024 * 1024);
+    ALLOCATOR.set_callback_threshold(100 * 1024 * 1024);
     ALLOCATOR.set_callback(|allocation| {
         println!("Threshold reached! Allocated: {} bytes", allocation);
     });
@@ -16,17 +16,30 @@ fn main() {
 
 There are two levels, meant to be used together:
 
-* **`set_threshold`** is advisory. Crossing it runs your callback and nothing
+* **`set_callback_threshold`** is advisory. Crossing it runs your callback and nothing
   else — dump a heap profile, shed load, drop buffers. Allocation carries on.
 
-* **`set_limit`** is a hard cap. Allocations that would take the process past it
-  fail, which ends the process on your terms at a limit you chose rather than
+* **`set_hard_limit`** refuses. Allocations that would take the process past it
+  fail, which ends the process on your terms at a figure you chose rather than
   the kernel's.
 
 ```rust
-THRESHER.set_threshold(3 * GIB);  // profile here
-THRESHER.set_limit(3 * GIB + 512 * MIB);  // refuse here
+THRESHER.set_callback_threshold(3 * GIB);  // profile here
+THRESHER.set_hard_limit(3 * GIB + 512 * MIB);  // refuse here
 ```
+
+## Upgrading from 0.1
+
+`set_threshold` / `get_threshold` are now `set_callback_threshold` /
+`get_callback_threshold`, and the hard limit added alongside them is
+`set_hard_limit` / `get_hard_limit`. Two settings both spelled "a number of
+bytes you care about" needed names that said which one refuses.
+
+`get_allocated()` also changed behaviour without changing signature: it is now
+approximate, lagging by up to 64 KiB per running thread, because the accounting
+is batched per thread rather than hitting one shared atomic on every allocation.
+See [Accounting & overhead](#accounting--overhead). If you were alerting on that
+number, `flush()` folds in the calling thread's balance.
 
 ## Motivation
 
@@ -48,15 +61,27 @@ Here are a few uses:
 ## The hard limit
 
 Past the limit, `alloc` returns null, which means `handle_alloc_error` and an
-abort. That is better than an OOM kill — you find out at a limit you chose, on
+abort. That is better than an OOM kill — you find out at a figure you chose, on
 your own terms, while the machine is still healthy — but it is still the end of
-the process, so leave headroom between the threshold and the limit for the
-callback to do its work.
+the process, and the abort message is the allocator's standard
+`memory allocation of N bytes failed` rather than anything of ours. Leave
+headroom between the threshold and the limit for the callback to do its work.
+
+To survive a refusal rather than die of it, allocate fallibly: `Vec::try_reserve`
+and friends turn the null into an `Err` instead of reaching `handle_alloc_error`
+at all, so the request that overran the limit fails while the process carries on.
 
 `Enforcement::MarkedThreads` narrows the limit to threads you opt in with
-`mark_current_thread(true)` — usually the pool running user work, so the cap
+`mark_current_thread(true)` — usually the pool running user work, so the limit
 fails on a query rather than on your logging. Every thread is still accounted for
 either way.
+
+The limit is not exact. It is compared against the shared total, which lags by up
+to 64 KiB per *other* running thread, and nothing locks between the check and the
+allocation, so concurrent threads can each pass a check only one of them would
+have passed in sequence. Both errors run the same way — the process can sit
+somewhat above the limit — so set it far enough below the ceiling you genuinely
+cannot cross that a few hundred kilobytes of slack does not matter.
 
 ## Accounting & overhead
 

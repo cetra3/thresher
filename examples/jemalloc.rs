@@ -14,7 +14,7 @@ async fn main() {
     // We use this to notify the async task that the threshold has been reached
     let (tx, mut rx) = watch::channel::<()>(());
 
-    ALLOCATOR.set_threshold(100 * 1024 * 1024);
+    ALLOCATOR.set_callback_threshold(100 * 1024 * 1024);
     ALLOCATOR.set_callback(move |_| {
         tx.send(()).ok();
     });
